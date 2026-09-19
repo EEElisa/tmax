@@ -86,9 +86,13 @@ class Vanillux2Agent(BaseAgent):
         command_timeout: int = 120,
         persistent_bash: bool = True,
         max_format_errors: int = 64,
+        system_prompt_file: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
+        # Optional file whose contents are appended to the stock system prompt (prompted-baseline arms;
+        # harbor --agent-kwarg system_prompt_file=/path). Read at run time so the job sees the weka file.
+        self.system_prompt_file = system_prompt_file
         self.max_steps = max_steps
         self.temperature = temperature
         self.top_p = top_p
@@ -120,8 +124,12 @@ class Vanillux2Agent(BaseAgent):
         context: AgentContext,
     ) -> None:
         model = self.model_name or "anthropic/claude-haiku-4-5"
+        system_prompt = _SYSTEM_TEMPLATE
+        if self.system_prompt_file:
+            with open(self.system_prompt_file, encoding="utf-8") as f:
+                system_prompt = _SYSTEM_TEMPLATE.rstrip() + "\n\n" + f.read().strip() + "\n"
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": _SYSTEM_TEMPLATE},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": _render_instance(instruction.strip())},
         ]
 

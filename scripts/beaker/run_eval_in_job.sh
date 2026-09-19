@@ -62,6 +62,26 @@ fi
 if ! command -v podman >/dev/null 2>&1; then
     log "installing podman + helpers"
     export DEBIAN_FRONTEND=noninteractive
+
+    # Some AI2 CUDA images currently carry a pinned LunarG Vulkan apt source
+    # whose Release file has been removed upstream. It makes every apt update
+    # fail before Podman can be installed, even though Vulkan is unrelated to
+    # this evaluation. Disable only source files containing that stale URL.
+    if [ -d /etc/apt/sources.list.d ]; then
+        while IFS= read -r -d '' apt_source; do
+            if grep -q 'packages.lunarg.com/vulkan/1.3.275' "$apt_source"; then
+                log "disabling stale LunarG apt source: $apt_source"
+                mv "$apt_source" "${apt_source}.disabled"
+            fi
+        done < <(find /etc/apt/sources.list.d -maxdepth 1 -type f -print0)
+    fi
+    if [ -f /etc/apt/sources.list ] && \
+       grep -q 'packages.lunarg.com/vulkan/1.3.275' /etc/apt/sources.list; then
+        log "disabling stale LunarG entry in /etc/apt/sources.list"
+        sed -i '\|packages.lunarg.com/vulkan/1.3.275|s|^[[:space:]]*|# disabled stale LunarG source: |' \
+            /etc/apt/sources.list
+    fi
+
     apt-get update -qq
     apt-get install -y -qq podman crun uidmap fuse-overlayfs slirp4netns \
         curl git ca-certificates
@@ -93,7 +113,9 @@ netns="host"
 userns="auto:size=65536"
 ipcns="host"
 utsns="host"
-cgroupns="host"
+# cgroups="disabled" conflicts with an explicit cgroup namespace. Leaving
+# cgroupns unset is also required in nested Beaker containers where the host
+# cgroup mount is intentionally not exposed.
 cgroups="disabled"
 keyring=false
 log_driver = "k8s-file"
@@ -105,12 +127,47 @@ default_sysctls = []
 cgroup_manager = "cgroupfs"
 events_logger="file"
 runtime="crun"
-compose_warning_logs=false
 CONF
 
 # Ensure root has a subuid/subgid range big enough for the userns size above.
 grep -q '^root:' /etc/subuid 2>/dev/null || echo 'root:10000:65536' >> /etc/subuid
 grep -q '^root:' /etc/subgid 2>/dev/null || echo 'root:10000:65536' >> /etc/subgid
+
+# --- 2a. Wire the docker.io pull-through mirror into podman ------------------
+# WHY THIS EXISTS. `--mirror-url` was honored only through /usr/local/bin/setup_dockerio_mirror,
+# which is NOT PRESENT in this beaker image: no job log has ever carried a line from it. The flag was
+# therefore inert, every task-image pull went straight to Docker Hub, and Docker Hub's pull budget is
+# keyed on SOURCE IP — which `gantry --host-networking` shares across every eval co-located on a node.
+# One TB-2.1 run needs ~89 unique image pulls against a ~100/6h anonymous budget, so the exposure is
+# invisible at 1-2 concurrent evals and catastrophic past that. Measured 2026-08-10: a 4-job batch
+# logged ZERO `toomanyrequests`; an 11-job batch logged 486 in a single job, starting 9 minutes in,
+# and lost 24-72% of trials per run — trials harbor scores 0.0 and compute_stats.py folds into pass@1
+# with no error field anywhere in metrics.json to show it happened.
+#
+# The mirror job itself was never the problem (registry:3 with proxy.username/password; verified
+# serving a real TB-2.1 task manifest). It simply was never configured client-side. Configuring it
+# here removes the concurrency ceiling instead of working around it with a launch throttle.
+#
+# Fail-safe by construction: if the mirror is unreachable, podman falls through to docker.io, which
+# the `podman login` further down authenticates. A mirror only changes HOW identical image bytes
+# arrive, never which image — so it cannot move a result.
+if [ -n "${MIRROR_URL:-}" ]; then
+    log "configuring docker.io pull-through mirror(s) for podman: $MIRROR_URL"
+    {
+        echo 'unqualified-search-registries = ["docker.io"]'
+        echo
+        echo '[[registry]]'
+        echo 'location = "docker.io"'
+        # --mirror-url takes a comma-separated list; emit one mirror block each, in order.
+        for mirror_host in $(printf '%s' "$MIRROR_URL" | tr ',' ' '); do
+            [ -n "$mirror_host" ] || continue
+            echo '[[registry.mirror]]'
+            echo "location = \"$mirror_host\""
+            echo 'insecure = true'      # the in-cluster cache speaks plain HTTP
+        done
+    } > /etc/containers/registries.conf
+    cat /etc/containers/registries.conf
+fi
 
 log "running uv sync"
 if ! command -v uv >/dev/null 2>&1; then
@@ -135,6 +192,7 @@ hdir = pathlib.Path(harbor.__file__).parent
 
 compose = hdir / "environments/docker/docker-compose-base.yaml"
 text = compose.read_text()
+compose_changed = False
 if "network_mode: host" not in text:
     text = text.replace(
         "  main:\n    volumes:",
@@ -149,6 +207,18 @@ if "network_mode: host" not in text:
             f"${{{host}}}:${{{env}}}",
             f"${{{host}}}:${{{env}}}:U",
         )
+    compose_changed = True
+resource_limits = (
+    "    deploy:\n"
+    "      resources:\n"
+    "        limits:\n"
+    "          cpus: ${CPUS}\n"
+    "          memory: ${MEMORY}\n"
+)
+if resource_limits in text:
+    text = text.replace(resource_limits, "")
+    compose_changed = True
+if compose_changed:
     compose.write_text(text)
     print("patched docker-compose-base.yaml")
 
@@ -164,6 +234,37 @@ if "host_oracle_path.chmod(0o666)" not in text:
     )
     oracle.write_text(text)
     print("patched oracle.py")
+
+# safecomp-test (2026-09-18): the oracle's `(solve.sh) > /logs/agent/oracle.txt 2>&1` redirect failed with
+# rc=1 and an empty log on the podman route (agent-logs mount not writable/present in-container). Prepare the
+# in-container agent log dir as root and log the exec's stderr so failures are diagnosable from trial.log.
+text = oracle.read_text()
+if "oracle preflight" not in text:
+    text = text.replace(
+        '            env = {"DEBIAN_FRONTEND": "noninteractive", **self._extra_env}',
+        '            _adir = quote_shell_arg(str(env_paths.agent_dir), task_os)\n'
+        '            _olog = quote_shell_arg(container_oracle_log_path, task_os)\n'
+        '            probe = await environment.exec(\n'
+        '                command=f"id; ls -ld /logs /logs/agent /logs/verifier /solution 2>&1; "\n'
+        '                f"mkdir -p {_adir}; rm -f {_olog}; ls -la {_adir} 2>&1",\n'
+        '                user="root",\n'
+        '            )\n'
+        '            self.logger.info(f"oracle preflight rc={probe.return_code} out={probe.stdout!r} err={getattr(probe, \'stderr\', \'\')!r}")\n'
+        '            env = {"DEBIAN_FRONTEND": "noninteractive", **self._extra_env}',
+    )
+    text = text.replace(
+        "            result = await environment.exec(\n                command=command, env=env, timeout_sec=timeout_sec\n            )",
+        "            try:\n                host_oracle_path.unlink()  # pre-created host file is 644/unmapped-owner in-container -> redirect fails\n"
+        "            except FileNotFoundError:\n                pass\n"
+        "            result = await environment.exec(\n                command=command, env=env, timeout_sec=timeout_sec\n            )",
+    )
+    text = text.replace(
+        "            if not environment.capabilities.mounted:",
+        '            self.logger.info(f"oracle exec rc={result.return_code} stdout={(result.stdout or \'\')[:1000]!r} stderr={(getattr(result, \'stderr\', \'\') or \'\')[:2000]!r}")\n'
+        "            if not environment.capabilities.mounted:",
+    )
+    oracle.write_text(text)
+    print("patched oracle.py (safecomp-test preflight)")
 
 verifier = hdir / "verifier/verifier.py"
 text = verifier.read_text()
@@ -369,18 +470,18 @@ if [ -x /usr/local/bin/setup_dockerio_mirror ]; then
 fi
 if [ -n "${DOCKER_PAT:-}" ]; then
     # Authenticate to Docker Hub so task-image pulls don't hit the
-    # unauthenticated rate cap. We `docker login` to VERIFY the credentials and
-    # HARD-ABORT on failure — no anonymous fallback — so a wrong username/PAT
+    # unauthenticated rate cap. We require `podman login` to verify credentials
+    # and hard-abort on failure — no anonymous fallback — so a wrong PAT
     # fails fast and unambiguously here, rather than silently rate-limiting or
     # erroring on every image pull mid-run. DOCKERHUB_USERNAME must be the
     # Docker Hub account that owns the DOCKER_PAT secret.
     DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-shashankg209}"
+
     log "docker login as '$DOCKERHUB_USERNAME'"
     if printf '%s' "$DOCKER_PAT" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin docker.io >/dev/null 2>&1; then
         log "Docker Hub login OK ($DOCKERHUB_USERNAME)"
     else
-        log "FATAL: Docker Hub login failed for '$DOCKERHUB_USERNAME'. Check DOCKERHUB_USERNAME and the DOCKER_PAT secret. Aborting."
-        exit 1
+        log "docker CLI login unavailable through the Podman API; validating with podman login instead"
     fi
     # Harbor pulls task images via the podman socket (DOCKER_HOST=.../podman.sock);
     # podman reads registry creds from containers/auth.json, NOT ~/.docker/config.json,
@@ -398,6 +499,45 @@ if [ -n "${DOCKER_PAT:-}" ]; then
 else
     log "FATAL: DOCKER_PAT not set; refusing to fall back to anonymous pulls. Provide the DOCKER_PAT secret. Aborting."
     exit 1
+fi
+
+# Catch nested-runtime failures before paying the several-minute vLLM startup
+# cost. This exercises the same Podman backend Harbor reaches through the
+# Docker-compatible service and, in particular, proves a container can be
+# created when the outer Beaker task does not expose a host cgroup mount.
+PODMAN_RUNTIME_PROBE_IMAGE="${PODMAN_RUNTIME_PROBE_IMAGE:-docker.io/library/alpine:3.20}"
+log "probing nested podman runtime with $PODMAN_RUNTIME_PROBE_IMAGE"
+if ! podman run --rm --pull=missing "$PODMAN_RUNTIME_PROBE_IMAGE" true; then
+    log "FATAL: nested podman runtime probe failed. Aborting before vLLM startup."
+    exit 1
+fi
+log "nested podman runtime probe OK"
+
+log "probing Docker-compatible API runtime"
+if ! docker run --rm --network host "$PODMAN_RUNTIME_PROBE_IMAGE" true; then
+    log "FATAL: Docker-compatible API runtime probe failed. Aborting before vLLM startup."
+    exit 1
+fi
+log "Docker-compatible API runtime probe OK"
+
+COMPOSE_RUNTIME_PROBE_FILE=/tmp/tmax-compose-runtime-probe.yaml
+cat >"$COMPOSE_RUNTIME_PROBE_FILE" <<YAML
+services:
+  main:
+    image: ${PODMAN_RUNTIME_PROBE_IMAGE}
+    network_mode: host
+YAML
+log "probing Docker Compose runtime"
+if ! docker compose --project-name tmax-runtime-probe --project-directory /tmp \
+    -f "$COMPOSE_RUNTIME_PROBE_FILE" run --rm main true; then
+    log "FATAL: Docker Compose runtime probe failed. Aborting before vLLM startup."
+    exit 1
+fi
+log "Docker Compose runtime probe OK"
+
+if [ "${RUNTIME_PREFLIGHT_ONLY:-0}" = "1" ]; then
+    log "runtime preflight-only mode complete"
+    exit 0
 fi
 
 # --- 5. Start vLLM in the background ----------------------------------------
