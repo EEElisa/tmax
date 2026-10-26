@@ -168,7 +168,14 @@ class Vanillux2Agent(BaseAgent):
                 except Exception:
                     pass
 
-                msg = response.choices[0].message.model_dump()
+                n_choices = len(response.choices)
+                if n_choices > 1:
+                    # litellm's Responses->chat bridge (openai/responses/<model>) returns one choice per
+                    # output text message plus a final choice holding all function calls; reading only
+                    # choices[0] drops the tool call whenever the model writes a text preamble.
+                    msg = self._merge_choice_messages(response.choices)
+                else:
+                    msg = response.choices[0].message.model_dump()
                 action = _extract_tool_call(msg)
                 if action["type"] == "no_tool_call":
                     msg.pop("tool_calls", None)
@@ -183,6 +190,8 @@ class Vanillux2Agent(BaseAgent):
                             "format_error": True,
                         }
                     )
+                    if n_choices > 1:
+                        timing_log[-1]["n_choices"] = n_choices
                     if format_errors >= self.max_format_errors:
                         logger.warning("Stopping after %s format errors", format_errors)
                         break
@@ -215,6 +224,8 @@ class Vanillux2Agent(BaseAgent):
                         "cmd": command[:200],
                     }
                 )
+                if n_choices > 1:
+                    timing_log[-1]["n_choices"] = n_choices
 
                 if action["type"] == "done" or SUBMIT_MARKER in tool_content:
                     break
@@ -293,6 +304,56 @@ class Vanillux2Agent(BaseAgent):
                     delay,
                 )
                 await asyncio.sleep(delay)
+
+    @staticmethod
+    def _merge_choice_messages(choices: list[Any]) -> dict[str, Any]:
+        """Merge a multi-choice response into one assistant message dict.
+
+        Only called when len(choices) > 1 (litellm's Responses bridge splits one response into a choice per
+        text message plus a last choice with every function call). Text content is joined in order; tool_calls,
+        reasoning_items, thinking_blocks and annotations are concatenated in order (the reasoning items must be
+        echoed back on the next request); provider_specific_fields are merged (first value wins); any other
+        field keeps its first non-None value.
+        """
+        dumps = [c.message.model_dump() for c in choices]
+        merged: dict[str, Any] = {}
+        for d in dumps:
+            for key, value in d.items():
+                if merged.get(key) is None and value is not None:
+                    merged[key] = value
+                else:
+                    merged.setdefault(key, value)
+
+        texts = [d["content"] for d in dumps if isinstance(d.get("content"), str) and d["content"]]
+        merged["content"] = "\n".join(texts) if texts else merged.get("content")
+
+        tool_calls = [tc for d in dumps for tc in (d.get("tool_calls") or [])]
+        for i, tc in enumerate(tool_calls):
+            if isinstance(tc, dict) and "index" in tc:
+                tc["index"] = i
+        merged["tool_calls"] = tool_calls or None
+
+        for key in ("reasoning_items", "thinking_blocks", "annotations"):
+            if any(key in d for d in dumps):
+                items = [x for d in dumps for x in (d.get(key) or [])]
+                merged[key] = items or None
+
+        if any("reasoning_content" in d for d in dumps):
+            rc = [
+                d["reasoning_content"]
+                for d in dumps
+                if isinstance(d.get("reasoning_content"), str) and d["reasoning_content"]
+            ]
+            merged["reasoning_content"] = "\n".join(rc) if rc else merged.get("reasoning_content")
+
+        psf: dict[str, Any] = {}
+        for d in dumps:
+            for key, value in (d.get("provider_specific_fields") or {}).items():
+                if psf.get(key) is None:
+                    psf[key] = value
+        merged["provider_specific_fields"] = psf or None
+        merged["role"] = merged.get("role") or "assistant"
+        return merged
 
     @staticmethod
     def _accumulate_usage(response: Any, usage_totals: dict[str, int]) -> None:
